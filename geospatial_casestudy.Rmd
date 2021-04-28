@@ -41,7 +41,7 @@ data_from_api <-
   RSocrata::read.socrata("https://data.sfgov.org/resource/vw6y-z8j6.json", 
                      stringsAsFactors = FALSE)
 
-And [here](https://data.sfgov.org/City-Infrastructure/311-Cases/vw6y-z8j6/data) is the website associated with the 311 data, which is updated daily with new repots. We need to download the `CSV` file from the website and load into our local environment to proceed. Keep in mind the file is large. Downloading and reading in to memory is intensive and can take some time. 
+And [here](https://data.sfgov.org/City-Infrastructure/311-Cases/vw6y-z8j6/data) is the website associated with the 311 data, which is updated daily with new reports. We need to download the `CSV` file from the website and load into our local environment to proceed. Keep in mind the file is large. Downloading and reading in to memory is intensive and can take some time. 
 
 __Once you place the downloaded CSV file into the same folder as this markdown, you are set up and ready to go with the rest of the code.__ 
 
