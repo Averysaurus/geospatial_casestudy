@@ -354,5 +354,5 @@ Reporting changes, system updates, and trends over time can bring up a host of i
 
 Crowdsourcing data from 311 certainly has its limitations, some of which we have been able to account for in this case study, others may require increased access, research and experimentation. That being said, there is a wealth of availble data with valuable analyses to put together from the __observations of observations__ we can gather with 311, available to anyone who cares about them! 
 
-Questions, comments, concerns? Feel free to contact me: avery.richards@berkeley.edu
+Questions, comments, concerns? Feel free to contact me here: avery.richards@berkeley.edu
 
