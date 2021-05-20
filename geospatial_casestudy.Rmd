@@ -1,0 +1,648 @@
+---
+title: "Geospatial Case Study - Mapping Open Defectation Prevalence"
+author: "Avery Richards"
+date: "Spring 2021"
+output: 
+  prettydoc::html_pretty:
+    theme: tactile
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, fig.align = 'center')
+```
+
+In this case study, we learn how to explore crowdsourced data to estimate a prevalence of events reported by residents of a city municipality. The example we are using is open defecation (Human or Animal Waste) on the streets of San Francisco. 
+
+Before we begin, let us pause for a moment and put our "public health caps" on to better understand why we are interested and even care about open defecation in the first place. Open defectation poses threats to human health via the [fecal-oral route](https://en.wikipedia.org/wiki/Fecal%E2%80%93oral_route). Prevention of disease acquired via the fecal-oral route is one of the main reason humans have developed sanitation systems over the centuries. Universal access to sanitation systems in the urban United States has become a resurgent issue, and the root of this problem can be attributed mostly to lack of appropriate housing and public sanitation infrastructure for those who are experiencing homelessness. 
+
+So while we explore these data and look to understand the events better, please consider that we are evaluating the symptoms of a deeply rooted social disease: *the lack of housing for everyone.* With that in mind, the fruit of this analysis hopes to triage the indignity of open defecation by humans in urban areas, providing insight into articluating evidence-based practices and deployment of sanitary interventions across an urban area.   
+
+```{r, message=FALSE, warning=FALSE}
+
+# install pacman if needed, install and load libraries
+if (!require("pacman")) install.packages("pacman")
+
+pacman::p_load(
+  RSocrata, tidyverse, lubridate, ggplot2, leaflet, sf, 
+  tmap, rgdal, prettydoc, hrbrthemes, raster, sp, spdep, 
+  spatstat, fields, car, pgirmess, geoR)
+
+# switch off scientific notation
+options(scipen = 99)
+
+# library(viridis)?
+
+# set tmap to view mode 
+tmap_mode("view")
+
+```
+
+#### A Note about accessing 311 data from API:
+
+It is possible to download a  current dataset from website, as well as use an `Rsocrata` package to import updated data directly from an API source. Here is what the code to do that looks like:
+
+data_from_api <- 
+  RSocrata::read.socrata("https://data.sfgov.org/resource/vw6y-z8j6.json", 
+                     stringsAsFactors = FALSE)
+
+And [here](https://data.sfgov.org/City-Infrastructure/311-Cases/vw6y-z8j6/data) is the website associated with the 311 data, which is updated daily with new reports. We need to download the `CSV` file from the website and load into our local environment to proceed. Keep in mind the file is large. Downloading and reading in to memory is intensive and can take some time. 
+
+__Once you set your directory to where the .csv file is, you are set up and ready to go with the rest of the code.__ 
+
+```{r,message = FALSE, warning = FALSE, eval=FALSE}
+
+# set your directory and import data. 
+path <- "where_the_downloaded_csv_is"
+setwd(path)
+
+```
+
+```{r,message = FALSE, warning = FALSE}
+
+# read in data
+report_data <- read_csv("311_Cases.csv")
+
+# organize column names for legibility
+report_data<- rename_with(report_data, ~ tolower(gsub(" ", "_", .x, fixed =TRUE)))
+
+# evaluate imported object
+dim(report_data)
+```
+
+#### Subsetting data:
+
+Now that we've imported our data object, we can run a few lines of code to specify the kind of reports we are interested in. 
+
+```{r, warning=FALSE}
+
+hum_anim_waste <- report_data %>% 
+  
+  # looking for "Waste" related calls while ignoring "Medical Waste"
+  filter(str_detect(request_type, "Waste") & 
+                    request_type != "Medical Waste") %>% 
+  
+  # restructure date and time variable as date alone
+  mutate(opened = as.character(opened)) %>% 
+  mutate(opened = str_remove(opened, "(\\d+:\\d+:\\d+\\s\\w+)")) %>% 
+  mutate(opened = as.character.Date(opened)) %>% 
+  mutate(opened = lubridate::mdy(opened)) %>% 
+  # watch out for extreme lat/longitude errors, or NA values in the coordinates column
+  filter(latitude> 37) %>% 
+  filter(longitude != 'NA'| latitude!= 'NA') %>% 
+  
+  # remove obvious duplicate values or animal care values upstream  
+  filter(responsible_agency != "Duplicate" & 
+         responsible_agency != "Animal Care") %>% 
+  
+  # finally make sure the latitude& longitude colums are treated as numeric values 
+  mutate(latitude= as.numeric(latitude)) %>% 
+  mutate(longitude = as.numeric(longitude)) 
+
+
+```
+
+```{r}
+
+# what is the date range of our reports?
+range(hum_anim_waste$opened)
+
+```
+
+#### Data Quality Part 1, Narrative Cues:
+
+Once we get in closer to the kind of reports we are looking for, we run into a complicated data quality issue. The 311 calls we are wrangling up here are based upon the reports and complaints of city residents, not the events themselves. The good news is we have a column in the dataset called `status_reports`, where department of public works staff report on what they find when responding to a call. 
+
+
+```{r}
+
+# how many unique status notes values are there?
+NROW(unique(hum_anim_waste$status_notes))
+
+```
+
+Here's where we need to employ a really hands-on evaluation process. In order to improve the data quality of these reports, we must dig into that `status_report` variable and find the narrative cues that tell us if the observation is a non-event, and then remove those non-event calls from our analysis. 
+
+
+```{r}
+
+# create a list of character strings that are cues indicating a non-event
+nar_cues <- c("Duplicate","nothing", "Nothing", "Case Transferred", 
+              "Insufficient Information","gone", "no work needed ",
+              "Unable to locate", "animal control", "not thing", 
+              "does not match", "not see any", "Unable to Locate",
+              "Case is Invalid", "noting", "see anything",
+              "dont see any",
+              "Not thing", "not at", "no poop", "see this", 
+              "wasnt there","looked both", "Duplicate", 
+              "Animal Care",
+              "no feces", "Unable To Locate", "not locate feces",
+              "No feces", "insufficient information", 
+              "does not exist", 
+              "didnt see any", "nothng", "WASTE NOT FOUND", 
+              "not sure where", 
+              "there is not", "did not find", "DUPLICATE",
+              "already removed", "No encampments", "nohing here",
+              "Cancelled", "dup", "duplicate", "incomplete", 
+              "no human waste", "no bird found", "in progress",
+              "no dead rat", "no human feces","invalid address", 
+              "no debris in the area", "NOTHING FOUND", 
+              "TRANS TO RECO",
+              "Cancel per 311", "not remove homeless", 
+              "INCORRECT CATEGORY", "Location not entered", 
+              "No human waste found", "NO HUMAN WASTE", "not there",
+              "no items visable", "GRAFFITI", "graffiti", 
+              "didnt see piles", "recology", "Recology",
+              "theres birds", "no encampment",
+              "this stuff", "Animal Care", "nothin here", "debris", 
+              "thats garbage", "does not have any feces", 
+              "loose garbage","rat removed",  "no waste back", 
+              "NOTHING BUT TRASH",  "unable to find", "not find any",
+              "nor did i see", "any feces", "and nothim", 
+              "couldn't find", "could not find", "wrong address",
+              "Abandon Vehicles", "ntohing found", "no poo", 
+              "vomit", "no pile of poo", "personal belonging",
+              "claimed", "needles", "cant locate", "Trash", 
+              "dog poop", "trash",
+              "items", "glass", "Dup", "nothing", "uable to locate")
+
+# add on new entries as needed.
+
+# function to remove any observations that contain strings that match "nar_cues" 
+hum_anim_waste_clean <- 
+  hum_anim_waste %>% 
+filter(!(str_detect(status_notes, 
+                  paste(nar_cues, collapse = "|"))))
+
+```
+
+*Okay!* So we have imported our dataset, located observations of interest, cleaned up the data a bit, created a list of character strings and purged those observations from our dataset. (this last part is really an ongoing process, but we have done what we can for now.) Next we will begin to map these data, exploring different ways to adjust and look at crowdsourced reports like these, as well as which approach is most helpful to look at crowdsourced "Human and Animal Waste" in this case. 
+
+```{r}
+
+```
+
+#### Mapping, Part 1:
+
+Let us pull out a month of reports and see what that looks like. 
+
+```{r}
+
+# reports from January 2020
+jan_calls <- hum_anim_waste_clean %>% 
+  filter(opened >= "2020-01-01" & 
+           opened < "2020-02-01") 
+
+# format as simple feature object
+map_jan_calls <-  st_as_sf(jan_calls, coords 
+                       = c('longitude','latitude'), crs = 4326)
+
+# small fix needed if using tidyverse with tmap package. 
+map_jan_calls_fix = st_as_sf(as.data.frame(map_jan_calls))
+
+# quickmap
+qtm(map_jan_calls_fix, dots.col = "red", symbols.size = .002)
+
+```
+
+Wow that is a lot of "Human or Animal Waste" reports in January of 2020! *Could it really be so intense on the streets of San Francisco?*  Well maybe, yes.. But let us take our data quality methods a step further to make more sense of the all the reports we have crowdsourced. 
+
+
+#### Data Quality Part 2, Distinct vs. Duplicated:
+
+Now that we have seen how "loud" the mapped points can be on their own, let us explore two very different ways of reducing the noise to signal ratio of these reports. The first approach is to remove everything but distinct values: only one unique address, latitude, and longitude coordinate per event in a given timeframe. 
+
+```{r}
+
+# create distinct observations only 
+jan_distinct_calls = jan_calls  %>% 
+  distinct(address, .keep_all = TRUE) %>% 
+      distinct(latitude, .keep_all = TRUE) %>% 
+        distinct(longitude, .keep_all = TRUE) 
+
+map_jan_distinct_calls <-  st_as_sf(jan_distinct_calls, coords 
+                       = c('longitude','latitude'), crs = 4326)
+
+# small fix needed if using tidyverse with tmap package. 
+map_jan_distinct_calls_fix = st_as_sf(as.data.frame(map_jan_distinct_calls))
+
+# quickmap
+qtm(map_jan_distinct_calls_fix, dots.col = "red", symbols.size = .002)
+
+```
+
+```{r}
+
+# what percentage of calls have we removed via distinct?
+round((nrow(map_jan_calls) - 
+         nrow(map_jan_distinct_calls)) / nrow(map_jan_calls),2)
+
+```
+
+Okay, this does not look like it has changed much from just looking at the map. We removed a small percentage of our calls by only looking at unique places where the event has occured. This approach may be helpful for certain types of analyses, especially useful when looking at short time intervals or other kinds of events that have a longer biological or social duration. Now let us try a different approach where we are only interested in points that have identical latitude and longitude coordinates instead. 
+
+
+```{r}
+
+# adjust for duplicated values only in the latitude column 
+dupl_lat <- duplicated(jan_calls$latitude)
+
+# create new object with only those duplicated latitude values 
+lat_select <- jan_calls[dupl_lat, ]
+
+# adjusting for duplicated values in the longitude column, from the lat_select object
+dupl_longitude <- duplicated(lat_select$longitude)
+
+# create a new object with only those duplicated latitude and longitude values. 
+jan_dupl_calls <- lat_select[dupl_longitude, ]
+
+# create a simple features map object
+map_jan_dupl <-  st_as_sf(jan_dupl_calls, coords 
+                       = c('longitude','latitude'), crs = 4326)
+
+# small fix needed if using tidyverse with tmap package. 
+map_jan_dupl_fix = st_as_sf(as.data.frame(map_jan_dupl))
+
+# quickmap
+m1 <- qtm(map_jan_dupl_fix, dots.col = "red", symbols.size = .002)
+m1 
+
+```
+
+__What a difference the duplicated approach makes!__ Almost all of our points are gone, and we are left with these hotspot locations.
+
+In the the case of Human or Animal Waste, looking at where events have occured in the same place could help explain social patterns as well as adjust some potential randomness associated with human behavior. Most importantly, knowing a certain area, a hotspot where events occur over time would allow us to provide a more thoughtful mobile interventions to vulnerable populations. We must consider that `duplicated()` ignores wider areas in favor of these impacted hotspots. In other contexts, and with different sorts of reported events `distinct()`, or even another functional approach may work better. There is always a trade off of some sort. At the end of the day, using `duplicated()` seems to be more useful given the nature ofevents we are observing here. 
+
+```{r}
+
+# what percentage of calls have we removed via the duplicated approach?
+round((nrow(map_jan_calls) - 
+         nrow(jan_dupl_calls)) / nrow(map_jan_calls),3)
+
+```
+
+When we expand our time interval of observations, the `duplicated()` approach scales well if we are looking at studying areas over longer periods of time. Let us do that now.
+
+```{r}
+
+# set time to 6 months. 
+jan_july_calls <- hum_anim_waste_clean %>% 
+  filter(opened >= "2020-01-01" & 
+           opened < "2020-07-01")
+
+# duplicated calls  
+jan_july_dupl_lat <- duplicated(jan_july_calls$latitude)
+jan_july_lat_select <- jan_july_calls[jan_july_dupl_lat, ]
+jan_july_dupl_longitude <- duplicated(jan_july_lat_select$longitude)
+jan_july_dupl_calls <- jan_july_lat_select[jan_july_dupl_longitude, ]
+
+# repeat code for 3 and 6 month intervals
+jan_march_dupl_calls <- jan_july_dupl_calls %>% 
+    filter(opened >= "2020-01-01" & 
+           opened < "2020-04-01")
+
+map_jan_march_waste_dupl <-  st_as_sf(jan_march_dupl_calls, coords 
+                       = c('longitude','latitude'), crs = 4326)
+map_jan_march_waste_dupl_fix = st_as_sf(as.data.frame(map_jan_march_waste_dupl))
+
+
+# repeat code for 3 and 6 month intervals
+jan_june_dupl_calls <- jan_july_dupl_calls %>% 
+    filter(opened >= "2020-01-01" & 
+           opened < "2020-07-01")
+
+map_jan_june_waste_dupl <-  st_as_sf(jan_june_dupl_calls, coords 
+                       = c('longitude','latitude'), crs = 4326)
+map_jan_june_waste_dupl_fix = st_as_sf(as.data.frame(map_jan_june_waste_dupl))
+
+# quickmap 2 and 3
+m2 <- qtm(map_jan_march_waste_dupl_fix, dots.col = "red", symbols.size = .002)
+m3 <- qtm(map_jan_june_waste_dupl_fix, dots.col = "red", symbols.size = .002)
+
+# arrange at 1, 3, and 6 month intervals.
+tmap_arrange(m1, m2, m3)
+# toggle out the first map to get an even view of the events. 
+
+```
+
+Moving left to right at 1, 3, & 6 month interval maps, it seems like there is a clear shape visible, in least more focused than when using the `distinct()`approach.
+
+#### Data Quality, Part 3: Participation Bias
+
+As we start thinking about analyses that invlove a longer timeframe of observations, we need to remind ourselves that we are sourcing data from a shifting population, namely *San Francisco residents who participate in 311 reporting on a given day*. There are differences in contributions to the data source itself, as we can observe in the scatteplot below.  
+
+```{r, warning=FALSE, message=FALSE }
+
+# organize data for chart 
+plot_part <- report_data %>% 
+  dplyr::select(opened) %>% 
+  mutate(opened = as.character(opened)) %>% 
+  mutate(opened= str_remove(opened, "(\\d+:\\d+:\\d+\\s\\w+)")) %>% 
+  mutate(opened = lubridate::mdy(opened)) %>% 
+  filter(opened >= "2019-01-01" & 
+           opened < "2021-01-01") %>% 
+  group_by(opened) %>% 
+  summarise(opened, n = n()) %>% 
+  distinct(opened, .keep_all = TRUE) 
+
+# plot chart
+ggplot(plot_part, aes(x= opened, y = n, group = 1))+
+  geom_point(color = 'steelblue', size = .5, alpha = .5)+
+  geom_smooth(method=lm , color="red", fill="#69b3a2", se=TRUE, aplha = .3) +
+  ggtitle("Documented 311 reports in San Francisco") +
+  ylab("Frequency of total reports") +
+  xlab(" ") +
+  theme_ipsum()
+
+```
+
+*What can we make of this scatterplot of aggregate 311 reports, circa 2019-2020?*
+
+Reporting changes, system updates, and trends over time can bring up a host of interesting data quality challenges with crowdsourced 311 data. An even greater limitation to an analysis frameworks is __spatial participation bias__: where certain areas, communities, individuals, and populations may not participate in 311 reporting for one reason or another.  Differences in participation to a reporting system like 311 can distort what we see and don't see from the available data.  However possible it may be to evaluate and chacterize users on a 311 system administrator level, external researchers have only the event reports themselves to work from. 
+
+Now that we have gotten a handle on our data, explored cleaning, as well as some limitations around our output, we can look at two differenct statistical analyses: one approach that uses`distinct()`, and another that uses the `duplicated()` data structures.
+
+#### Statistical Analyses, Part 1: Density Plotting.
+
+Looking at hundreds and hundreds of coordinates together on a map will overwhelm the eyes of any human being. Density Plotting is a tool we can use to explore large amounts of coordinate data to get a stronger visual sense of the distribution of events in space. 
+
+To begin, we will use a [Shapefile of San Francisco](https://data.sfgov.org/Geographic-Locations-and-Boundaries/SF-Find-Neighborhoods/pty2-tcw4) to help us establish a coordinate reference system for our density plot. 
+
+```{r}
+
+# import shapefile of San Francisco neighborhoods
+sf_nhoods <- readOGR(dsn = "Analysis Neighborhoods", 
+    layer = "geo_export_dfbc5470-1876-41c8-90fb-f3d80661c272")
+
+# remove Treasure Island for spatial contiguity
+sf_nhoods <- sf_nhoods[sf_nhoods$nhood != "Treasure Island", ]
+
+# plot shapefile 
+plot(sf_nhoods, main = "San Francisco Neighborhood Boundaries.") 
+
+```
+
+Next we will format our data as a spatial object, create a `window` to calculate our density from, and calculate the density of points within that window.
+
+```{r, warning = FALSE}
+
+# coerce our distinct() points into a spatial data frame object
+jan_waste_spdf <- sp::SpatialPointsDataFrame(coords = 
+            jan_distinct_calls[,c("longitude", "latitude")],
+            data = jan_distinct_calls[,c("neighborhood")],
+             proj4string = CRS("+init=epsg:4326"))
+
+# create a window object with the range of distinct() points.  
+sf_owin <- owin(xrange=range(jan_distinct_calls$longitude),
+                yrange=range(jan_distinct_calls$latitude))
+
+# create point pattern density object
+sf_ppp <- ppp(jan_distinct_calls$longitude, 
+              jan_distinct_calls$latitude, 
+              window = sf_owin)
+
+# create a raster layer from the point pattern density object.
+density_raster <- 
+  raster(density(sf_ppp, bw.ppl), crs = crs(sf_nhoods))
+
+```
+
+
+```{r, warning= FALSE }
+
+# set a palette to define a color range for mapping.
+raster_pal <- colorNumeric(palette = tim.colors(), 
+   domain = values(density_raster), na.color = NA)
+
+leaflet() %>% addProviderTiles("CartoDB.Positron") %>%
+  addPolygons(data=sf_nhoods,
+              fillOpacity=0, opacity = .1, 
+              weight = 1, color = "black") %>% 
+  addRasterImage(density_raster, opacity=0.5, col = raster_pal)
+
+```
+
+Here we are with a density plot of events from January 2020. To do this correctly, we needed to use the `distinct()` approach. Otherwise we would have more than one point per coordinate and our density function would be distorted. 
+
+#### Statistical Analyses, Part 2: LISA
+
+Positive spatial autocorrelation is the tendency for areas or sites that are close together to have similar values. A common statistical method to detect spatial autocorrelation is the [Moran's I test](https://en.wikipedia.org/wiki/Moran%27s_I). Based on the princpals of a Moran's I test, Local Indicators of Spatial Autocorrelation (LISAs) can be used to understand how each coordinate *itself* gives an indication of the extent of spatial clustering of similar values in proximity. 
+
+Let us walkthrough how to conduct a LISA and map our results with this type of 311 data. So far we have been looking at events alone, single points on our maps, essentially `x` and `y` points. Now we need to generate `z` values associated with our points to be able to determine if spatial autocorrelation is detectable. To do that we well expand upon the `duplicated()` approach we used earlier, but this time we count the events at each point to measure the intensity of events a at particular coordinate over the year. 
+
+```{r}
+
+# subset a year's worth of reports
+year_waste <- hum_anim_waste %>%   
+filter(opened >= "2020-01-01" & 
+           opened < "2021-01-01") 
+
+# count the events if more than one occured at a certain point 
+dup_waste <- year_waste %>% 
+  dplyr::select(opened, latitude, longitude) %>% 
+  group_by(latitude, longitude) %>% 
+  mutate(events = n()) %>% 
+  filter(events > 1) %>% 
+  distinct(latitude, .keep_all = T) %>% 
+  distinct(longitude, .keep_all = T)
+
+head(dup_waste)
+```
+
+```{r}
+
+# set palette to map events
+pal = colorNumeric("Oranges", dup_waste$events)
+
+# map duplicate coordinate event
+leaflet(dup_waste) %>% addProviderTiles("CartoDB.Positron") %>% 
+  addCircleMarkers(~longitude, ~latitude, fillOpacity=.5,
+  fillColor= ~pal(events), radius=~events/2, stroke=TRUE, weight=1) %>% 
+  addLegend(pal = pal, values = ~events)
+
+```
+
+This map is an abstract sort of visualization, but helps us evaluate how each of these `duplicated()` coordinates are impacted over a year's time. 
+
+Next we will create an inverse distance matrix to from the coordinate of all these points together. 
+
+```{r, message= FALSE}
+
+# take a log odds of the event intesity 
+dup_waste$log_odds <- car::logit(dup_waste$events)
+
+# create matrix
+event_dists <- as.matrix(dist(cbind(dup_waste$longitude, 
+                        dup_waste$latitude)))
+
+# divide by 1 to invert all the values
+event_dists_inv <- 1 / event_dists
+
+# be sure to insert a 0 down the middle! 
+diag(event_dists_inv) <- 0 
+
+# calculate maximum distance in matrix 
+max_dist <- max(dist(cbind(dup_waste$longitude, 
+                        dup_waste$latitude)))
+
+
+```
+
+With that matrix put together, we can begin to look at how distance effects positive spatial autocorrelation. 
+
+```{r}
+
+# create an array with the latitude and longitude points
+xy <- cbind(dup_waste$longitude, 
+         dup_waste$latitude)
+
+# create a correlogram
+pgi_cor <- pgirmess::correlog(coords=xy, 
+                    z=dup_waste$log_odds, 
+                    method="Moran", nbclass=10)
+
+# plot correlogram
+plot(pgi_cor, main = "Bins of Spatial Cluster Distance, degrees")
+
+```
+
+The 2 red dots indicate statistcally significant values, which help us explain at what distance postive spatial autocorrelation has a good chance of happening. The values we get here are `.01` and `.02` degrees, or about 1 mile or so apart. 
+
+Once we have observable evidence that PSA exists in these data, we can assign weights to each point and run a local moran's I on each point together and have a look at the coefficients. Be warned, the `printCoefmat` function is stubbornly verbose. __Just keep scrolling!__  Feel free to check out those significant p-values indicating evidence of PSA at each point along the way if you like. 
+
+```{r }
+
+# set coordinates to create a spatial object
+coords <- coordinates(xy)
+
+# set row names for neighbors list.
+matrix_ids <- row.names(as.data.frame(coords))
+
+# create neighbours list
+neigh_nb <- knn2nb(knearneigh(coords, k=1, 
+                              longlat = TRUE), 
+                              row.names= matrix_ids) 
+
+# returns the distance between nearest neighbors for each point
+dists <- unlist(nbdists(neigh_nb,coords)) 
+
+# returns maximum distance between nearest neighbors for each point
+max_one_nn <- max(dists)
+
+# set spatial coordiates 
+neigh_kd_one <- dnearneigh(coords, d1=0, d2=max_one_nn, row.names=matrix_ids)
+
+# set weights 
+weights <- nb2listw(neigh_kd_one, 
+# style the weights to sum over all links                 
+                    style="W")   
+
+# run local moran function with the log_odds of events
+lisa <-localmoran(dup_waste$log_odds, weights)                      
+
+# print coefficients for each point 
+Coef <- stats::printCoefmat(data.frame(lisa[matrix_ids,], row.names=row.names(coords), check.names=FALSE))
+
+```
+
+Okay, you made it! Thank you for scrolling through all that. 
+
+Next we are going to plot the spatial data against its spatially lagged values.       
+
+```{r}
+
+# create a moran.plot
+nci <- moran.plot(dup_waste$log_odds, listw=weights, 
+     xlab="Log prevalence", ylab="Spatially lagged log prev",
+     labels=T, pch=16, col="grey")
+
+```
+
+The output is a little crowded in this case, but the `moran.plot`function allows us to conveniently extract those statistically significant points we saw in the verbose `printCoefmat` output.
+
+```{r}
+
+# find which points are statistically significant outliers
+infl <- nci$is_inf == T 
+outlier_points <- sum(infl==T)  
+
+paste(outlier_points, "significant outlier points.")
+
+```
+
+Now that we have extracted the significant outliers in our distribution of points, we coerce them into a factors with four total classes defined as: 
+
+* High value points correlated around other High value points.
+* High value points correlated around Low value points.
+* Low value points correlated around High value points.
+* Low value points correlated around other Low value points.
+
+Once we have created these classes, we can project the points onto a map and view our results. 
+
+```{r}
+
+# create vector of logged odds of events
+x <- dup_waste$log_odds
+
+# cut into factor with two levels.
+lhx <- cut(x, breaks=c(min(x), 
+                       mean(x), 
+                       max(x)), labels=c("L", "H"),
+                       include.lowest=T)
+
+# lag, based upon weights of the data
+wx <- stats::lag(weights, dup_waste$log_odds)
+
+# create factor with 2 levels 
+lhwx <- cut(wx, breaks=c(min(wx), mean(wx), 
+                     max(wx)), labels=c("L", "H"), 
+                     include.lowest=T)
+
+# compute a factor interaction
+lhlh <- interaction(lhx,lhwx,infl,drop=T)
+
+# add column names to output
+names <- rep("none", length(lhlh))
+names[lhlh=="L.L.TRUE"]<-"Low with Low"
+names[lhlh=="H.L.TRUE"]<-"High with Low"
+names[lhlh=="L.H.TRUE"]<-"Low with High"
+names[lhlh=="H.H.TRUE"]<-"High with High"
+
+# bind names with coordinate observations
+dup_waste_lisa <- as.data.frame(cbind(xy, names))
+
+# tidy the dataframe
+dup_waste_lisa <- dup_waste_lisa %>% 
+# rename columns
+  rename(longitude = V1) %>% 
+  rename(latitude = V2) %>% 
+# structure coordinates
+  mutate(longitude = as.numeric(longitude)) %>% 
+  mutate(latitude  = as.numeric(latitude)) %>% 
+# filter non-significant values in the map
+  filter(names != "none") 
+
+# create palette for map
+factpal <- colorFactor(c( "red","blue","orange","purple"), names)
+
+# map LISA values
+leaflet(dup_waste_lisa) %>% 
+  addProviderTiles("CartoDB.Positron") %>% 
+  addPolygons(data=sf_nhoods,
+              fillOpacity=0, weight = 1, 
+              color = "grey", opacity = .8) %>% 
+  addCircleMarkers(~longitude, ~latitude, fillOpacity=.4,
+  color= ~factpal(names), radius=3, stroke=TRUE, weight=.5) %>% 
+  addLegend(pal = factpal, values = ~names, 
+            title="Event Correlation Class", position = "bottomleft") 
+
+```
+
+Here we are with our mapped results. The LISA method allows us to articulate local PSA relationships in the duplicated point areas based on the intensity of events at the location. With this method, we are able to characterize the autocorrelative relationship in reference to other points around each significant PSA location. Analyses like these could help determine how much, and even what kind of sanitary intervention to apply to a certain area in San Francisco. 
+
+#### Conclusion:
+
+Crowdsourcing data from 311 certainly has its limitations, some of which we have been able to account for in this case study, others may require increased access, research, understanding, and experimentation. That being said, there is a wealth of availble data with valuable analyses to put together from the __observations of observations__ we are able to gather with 311, available to anyone who cares! 
+
+Questions, comments, concerns? Feel free to contact me: [avery.richards@berkeley.edu](avery.richards@berkeley.edu)
+
