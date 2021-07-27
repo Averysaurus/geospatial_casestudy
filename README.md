@@ -4,6 +4,6 @@ Walkthrough for how to access, subset, and evaluate, and run a few statistical a
 R-pub Link:
 https://rpubs.com/Averysaurus/spatial_epi_311data
 
-Link to video presentation:
+Video presentation:
 https://youtu.be/9kdt7lpsxKU
 
